@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Conservative RPM/Flatpak uninstaller for Fedora."""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+# Artwork: blyxyas/uwu-neofetch-art, CC0.
+PORTRAIT = """⡆⣐⢕⢕⢕⢕⢕⢕⢕⠅⢗⢕⢕⢕⢕⢕⢕⠕⠕⢕⢕⢕⢕⢕⢕⢕⢕⢕
+⢐⢕⢕⢕⢕⣕⢕⢕⠕⠁⢕⢕⢕⢕⢕⢕⠅⡄⢕⢕⢕⢕⢕⢕⢕⢕⢕
+⢕⢕⢕⢕⢕⠅⢗⢕⠕⣠⠄⣗⢕⢕⠕⢕⢕⢕⠕}⠐⢕⢕⢕⠑⢕⢕⠵⢕
+⢕⢕⢕⢕⠁⢜⠕⢁⣴⣿⡇⢓⢕⢵⢐⢕⢕⠕⢁⣾⢿⣧⠑⢕⢕⠄⢑⢕⠅⢕
+⢕⢕⠵⢁⠔⢁⣤⣤⣶⣶⣶⡐⣕⢽⠐⢕⠕⣡⣾⣶⣶⣶⣤⡁⢓⢕⠄⢑⢅⢑
+⠍⣧⠄⣶⣾⣿⣿⣿⣿⣿⣿⣷⣔⢕⢄⢡⣾⣿⣿⣿⣿⣿⣿⣿⣦⡑⢕⢤⠱⢐
+⢠⢕⠅⣾⣿⠋⢿⣿⣿⣿⠉⣿⣿⣷⣦⣶⣽⣿⣿⠈⣿⣿⣿⣿⠏⢹⣷⣷⡅⢐
+⣔⢕⢥⢻⣿⡀⠈⠛⠛⠁⢠⣿⣿⣿⣿⣿⣿⣿⣿⡀⠈⠛⠛⠁⠄⣼⣿⣿⡇⢔
+⢕⢕⢽⢸⢟⢟⢖⢖⢤⣶⡟⢻⣿⡿⠻⣿⣿⡟⢀⣿⣦⢤⢤⢔⢞⢿⢿⣿⠁⢕
+⢕⢕⠅⣐⢕⢕⢕⢕⣿⣿⡄⠛⢀⣦⠈⠛⢁⣼⣿⢗⢕⢕⢕⢕⢕⢕⡏⣘⢕
+⢕⢕⠅⢓⣕⣕⣕⣵⣿⣿⣿⣾⣿⣿⣿⣿⣿⣿⣿⣿⣷⣕⢕⢕⢕⢕⡵⢀⢕⢕
+⢑⢕⠃⡈⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⢕⢕⢕
+⣆⢕⠄⢱⣄⠛⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢁⢕⢕⠕⢁
+⣿⣦⡀⣿⣿⣷⣶⣬⣍⣛⣛⣛⡛⠿⠿⠿⠛⠛⢛⣛⣉⣭⣤⣂⢜⠕⢑⣡⣴⣿"""
+
+
+@dataclass(frozen=True)
+class App:
+    identifier: str
+    name: str
+    kind: str
+    target: str
+    scope: str = ""
+    summary: str = ""
+    is_app: bool = True
+
+
+def command(args: list[str], *, english: bool = False) -> subprocess.CompletedProcess[str]:
+    try:
+        env = {**os.environ, "LC_ALL": "C"} if english else None
+        return subprocess.run(args, capture_output=True, text=True, check=False, env=env)
+    except OSError as error:
+        raise RuntimeError(f"Не удалось запустить {args[0]}: {error}") from error
+
+
+def installed() -> list[App]:
+    apps: list[App] = []
+    errors: list[str] = []
+    if shutil.which("rpm"):
+        result = command(["rpm", "-qa", "--qf", "%{NAME}\t%{ARCH}\t%{SUMMARY}\n"])
+        if result.returncode:
+            errors.append(f"RPM: {result.stderr.strip()}")
+        else:
+            # A desktop launcher is evidence of an application, not a guarantee
+            # that other RPMs are system components (CLI tools have no launcher).
+            launchers = sorted(str(path) for path in Path("/usr/share/applications").glob("*.desktop"))
+            owners: set[str] = set()
+            if launchers:
+                ownership = command(["rpm", "-qf", "--qf", "%{NAME}\n", *launchers])
+                owners = set(ownership.stdout.splitlines())
+            for line in result.stdout.splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    name, arch, summary = parts
+                    target = f"{name}.{arch}"
+                    apps.append(App(f"rpm:{target}", name, "RPM", target,
+                                    summary=summary, is_app=name in owners))
+    if shutil.which("flatpak"):
+        result = command([
+            "flatpak", "list", "--app",
+            "--columns=application,name,installation,arch,branch",
+        ])
+        if result.returncode:
+            errors.append(f"Flatpak: {result.stderr.strip()}")
+        else:
+            for line in result.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) != 5:
+                    continue
+                app_id, name, scope, arch, branch = parts
+                if scope not in ("system", "user") or not all((app_id, arch, branch)):
+                    continue
+                ref = f"app/{app_id}/{arch}/{branch}"
+                apps.append(App(f"flatpak:{scope}:{ref}", name or app_id,
+                                "Flatpak", ref, scope))
+    # Qt Installer Framework installations are not registered with RPM/Flatpak.
+    # Only list directories with both a maintenance tool and a desktop entry.
+    opt = Path("/opt")
+    try:
+        directories = list(opt.iterdir())
+    except OSError:
+        directories = []
+    for directory in directories:
+        try:
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            tool = directory / "maintenancetool"
+            desktop = next(directory.glob("*.desktop"), None)
+            if not tool.is_file() or desktop is None:
+                continue
+            if shutil.which("rpm") and command(["rpm", "-qf", str(tool)]).returncode == 0:
+                continue
+            name = directory.name
+            for line in desktop.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("Name=") and line[5:].strip():
+                    name = line[5:].strip()
+                    break
+            apps.append(App(f"installer:{directory}", name, "Установщик",
+                            str(directory)))
+        except OSError:
+            continue
+    if errors:
+        print("Предупреждение: " + "; ".join(errors), file=sys.stderr)
+    return sorted(apps, key=lambda app: (app.name.casefold(), app.identifier))
+
+
+def lookup(identifier: str, apps: list[App]) -> App:
+    for app in apps:
+        if app.identifier == identifier:
+            return app
+    raise ValueError("Приложение с таким ID не найдено среди установленных.")
+
+
+def search(query: str, apps: list[App], *, all_rpm: bool = False) -> list[App]:
+    query = query.strip().casefold()
+    if not query:
+        raise ValueError("Укажите непустое название программы.")
+    matches = [app for app in apps if (all_rpm or app.is_app)
+               and (query in app.name.casefold() or query in app.target.casefold()
+                    or query in app.summary.casefold())]
+    matches.sort(key=lambda app: (0 if app.name.casefold() == query else
+                                  1 if app.name.casefold().startswith(query) else 2,
+                                  app.name.casefold()))
+    return matches
+
+
+def show(app: App) -> None:
+    print(f"Название: {app.name}\nТип: {app.kind}\nID: {app.identifier}")
+    if app.summary:
+        print(f"Описание: {app.summary}")
+    if app.scope:
+        print(f"Установка: {app.scope}")
+    if app.kind == "RPM" and not app.is_app:
+        print("Категория: RPM без ярлыка (возможно, консольная программа или системный пакет).")
+    if app.kind == "Установщик":
+        print("deletex не запускает удаление этого типа установок.")
+    else:
+        print("Данные пользователя не удаляются.")
+
+
+def preview(app: App) -> bool:
+    show(app)
+    if app.kind == "RPM":
+        print("\nПроверка транзакции DNF (ответ «нет», ничего не удаляется):", flush=True)
+        result = command(["dnf", "--assumeno", "remove", app.target], english=True)
+        if result.stdout:
+            print(result.stdout.rstrip())
+        if result.stderr:
+            print(result.stderr.rstrip(), file=sys.stderr)
+        # A return code of 0 can mean "Nothing to do"; a failed transaction may
+        # also print output. Require the exact DNF5 refusal and a real summary.
+        lines = result.stdout.splitlines()
+        diagnostics = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+        valid = (result.returncode == 1
+                 and "Removing:" in lines
+                 and "Transaction Summary:" in lines
+                 and any(re.fullmatch(r"\s*Removing:\s*[1-9]\d* packages?\s*", line)
+                         for line in lines)
+                 and "Operation aborted by the user." in diagnostics
+                 and all(line.startswith("After this operation,")
+                         or line == "Operation aborted by the user." for line in diagnostics))
+        if not valid:
+            print("Не удалось проверить транзакцию. Удаление запрещено.", file=sys.stderr)
+            return False
+        return True
+    if app.kind == "Установщик":
+        print(f"\nСобственный инструмент удаления: {app.target}/maintenancetool")
+        print("Его сценарии могут останавливать службы и удалять пользовательские файлы.")
+        print("Автоматическое удаление таких установок в deletex не поддерживается.")
+        return False
+    print("\nFlatpak удалит только указанный app-ref (без связанных расширений).")
+    print("Flatpak не предоставляет надёжного предварительного расчёта удаления;")
+    print("перед выполнением он покажет собственный запрос на подтверждение.")
+    return True
+
+
+def remove(app: App) -> int:
+    if not preview(app):
+        return 1
+    print(f"\nДля продолжения введите точный ID: {app.identifier}")
+    try:
+        answer = input("> ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nОтменено.")
+        return 1
+    if answer != app.identifier:
+        print("Отменено: ID не совпал.")
+        return 1
+    if app.kind == "RPM":
+        # DNF asks again before committing, including for dependencies.
+        args = ["dnf", "remove", app.target]
+        if not sys.stdin.isatty():
+            print("Удаление RPM требует интерактивного терминала.", file=sys.stderr)
+            return 1
+        if subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip() != "0":
+            args.insert(0, "sudo")
+    else:
+        args = ["flatpak", "uninstall", f"--{app.scope}", "--no-related", "--app", app.target]
+    try:
+        return subprocess.run(args, check=False).returncode
+    except OSError as error:
+        print(f"Не удалось запустить менеджер пакетов: {error}", file=sys.stderr)
+        return 1
+
+
+def choose(title: str, header: str, options: list[str], *, artwork: bool = False) -> int | None:
+    """Choose a numbered item, using pm/updatex-style fzf when available."""
+    if sys.stdin.isatty() and sys.stdout.isatty() and shutil.which("fzf"):
+        size = shutil.get_terminal_size()
+        if artwork and size.lines >= 27 and size.columns >= 52:
+            header = f"{PORTRAIT}\n\n{header}"
+        result = command_fzf(title, header, options)
+        if result is None:
+            return None
+        try:
+            return int(result.split(" ", 1)[0])
+        except ValueError:
+            return None
+    print(f"\n✿ {title}\n{header}\n")
+    for option in options:
+        print(option)
+    try:
+        return int(input("Номер пункта: ").strip())
+    except ValueError:
+        return None
+
+
+def command_fzf(title: str, header: str, options: list[str]) -> str | None:
+    result = subprocess.run([
+        "fzf", "--no-sort", "--no-input", "--info=hidden", "--cycle",
+        "--layout=reverse", "--height=~26", "--border=rounded",
+        f"--border-label= ✿ {title} ", "--header-first", f"--header={header}",
+        "--pointer=❯", "--color=pointer:#f5a9c5,hl:#f5a9c5,fg+:#f5a9c5,border:#b68abd",
+        "--footer=↑↓ выбрать  ·  Enter подтвердить  ·  Esc выйти",
+    ], input="\n".join(options) + "\n", capture_output=True, text=True, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def interactive(apps: list[App]) -> int:
+    while True:
+        action = choose("deletex", "Fedora · RPM · Flatpak · установщики /opt", [
+            "1  🔎 Найти программу", "2  🧰 Искать среди всех RPM",
+            "3  🚪 Выход",
+        ], artwork=True)
+        if action not in (1, 2):
+            return 0
+        query = input("\nНазвание программы: ")
+        matches = search(query, apps, all_rpm=action == 2)
+        if not matches:
+            print("Совпадений нет. Для RPM без ярлыка выбери поиск среди всех RPM.")
+            continue
+        shown = matches[:50]
+        options = [f"{i}  {app.name} [{app.kind}] · {app.identifier}"
+                   for i, app in enumerate(shown, 1)]
+        choice = choose("Результаты поиска", f"Найдено: {len(matches)} · {query}", options)
+        if choice is None or not 1 <= choice <= len(shown):
+            continue
+        app = shown[choice - 1]
+        print()
+        safe = preview(app)
+        if not safe:
+            continue
+        choice = choose("Действие", f"{app.name} · {app.kind}", [
+            "1  🗑  Перейти к удалению", "2  ↩ Вернуться к поиску",
+        ])
+        if choice == 1:
+            remove(app)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="deletex", description="Поиск и безопасное удаление RPM/Flatpak в Fedora"
+    )
+    sub = parser.add_subparsers(dest="action")
+    search_parser = sub.add_parser("search", help="найти программу")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--all", action="store_true", dest="all_rpm",
+                               help="включить RPM без .desktop (в том числе системные)")
+    sub.add_parser("inspect", help="показать программу и последствия удаления").add_argument("id")
+    sub.add_parser("remove", help="удалить после подтверждения").add_argument("id")
+    args = parser.parse_args()
+    try:
+        apps = installed()
+        if args.action is None and sys.stdin.isatty():
+            return interactive(apps)
+        if args.action in (None, "search"):
+            query = args.query if args.action == "search" else input("Название программы: ")
+            matches = search(query, apps,
+                             all_rpm=args.all_rpm if args.action == "search" else False)
+            if not matches:
+                print("Совпадений нет. Для RPM без ярлыка: deletex search --all НАЗВАНИЕ.")
+            else:
+                for app in matches[:50]:
+                    print(f"{app.name} [{app.kind}]  {app.identifier}")
+                if len(matches) > 50:
+                    print(f"Показаны первые 50 из {len(matches)}; уточните запрос.")
+            return 0
+        app = lookup(args.id, apps)
+        if args.action == "inspect":
+            safe = preview(app)
+            return 0 if safe or app.kind == "Установщик" else 1
+        return remove(app)
+    except (ValueError, RuntimeError) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        print("\nОтменено.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
